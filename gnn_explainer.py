@@ -129,14 +129,14 @@ class GNNExplainer(torch.nn.Module):
             loss = loss + self.coeffs['node_feat_size'] * node_feat_reduce(m)
             ent = -m * torch.log(m + EPS) - (1 - m) * torch.log(1 - m + EPS)
             loss = loss + self.coeffs['node_feat_ent'] * ent.mean()    
-            
         else:     
-            loss = -log_logits
-            m = self.edge_mask.sigmoid()
-            edge_reduce = getattr(torch, self.coeffs['edge_reduction'])
-            loss = loss + self.coeffs['edge_size'] * edge_reduce(m)
-            ent = -m * torch.log(m + EPS) - (1 - m) * torch.log(1 - m + EPS)
-            loss = loss + self.coeffs['edge_ent'] * ent.mean()
+            loss = -log_logits[0][pred_label.long()] #.gather(1, pred_label.view(-1,1)).sum()
+            
+        m = self.edge_mask.sigmoid()
+        edge_reduce = getattr(torch, self.coeffs['edge_reduction'])
+        loss = loss + self.coeffs['edge_size'] * edge_reduce(m)
+        ent = -m * torch.log(m + EPS) - (1 - m) * torch.log(1 - m + EPS)
+        loss = loss + self.coeffs['edge_ent'] * ent.mean()
             
         return loss
 
@@ -200,7 +200,7 @@ class GNNExplainer(torch.nn.Module):
 
         return node_feat_mask, edge_mask
 
-    def explain_graph(self, x, edge_index, **kwargs):
+    def explain_graph(self, x, edge_index, n_graphs = 1, **kwargs):
         r"""Learns and returns an edge mask that play a
         crucial role to explain the prediction made by the GNN for the graph.
 
@@ -215,34 +215,41 @@ class GNNExplainer(torch.nn.Module):
         self.model.eval()
         self.__clear_masks__()
 
-        num_edges = edge_index.size(1)
-
-        # Only operate on a k-hop subgraph around `node_idx`.
-        x, edge_index, mapping, hard_edge_mask, kwargs = self.__subgraph__(
-            None, x, edge_index, **kwargs)
+        num_edges = edge_index.size(1)//n_graphs
+        num_nodes = x.shape[0]//n_graphs
 
         # Get the initial prediction.
         with torch.no_grad():
             log_logits = self.model(x=x, edge_index=edge_index, **kwargs)
-            pred_label = log_logits.argmax(dim=-1)
+            pred_labels = log_logits.argmax(dim=-1)
 
-        self.__set_masks__(x, edge_index)
         self.to(x.device)
 
-        optimizer = torch.optim.Adam([self.edge_mask],
-                                     lr=self.lr)
-
+        edge_masks = torch.zeros(0).to(x.device)
+        
         if self.log:  # pragma: no cover
-            pbar = tqdm(total=self.epochs, position=0, leave=True)
-            pbar.set_description('Explain graph')
-
-        for epoch in range(1, self.epochs + 1):
-            optimizer.zero_grad()
-            #h = x * self.node_feat_mask.view(1, -1).sigmoid()
-            log_logits = self.model(x=x, edge_index=edge_index, **kwargs).max(1)[0].sum()
-            loss = self.__loss__(mapping, log_logits, pred_label)
-            loss.backward()
-            optimizer.step()
+            pbar = tqdm(total=n_graphs, position=0, leave=True)
+            pbar.set_description(f'Explaining {n_graphs} graph')
+        for graph_idx in range(n_graphs):
+            graph_x = x[(graph_idx*num_nodes):((graph_idx*num_nodes)+num_nodes), :].to(x.device)      
+            graph_edge_index = edge_index[:, (graph_idx*num_edges):((graph_idx*num_edges)+num_edges)].to(x.device)%num_nodes
+            graph_batch = kwargs['batch'][(graph_idx*num_nodes):((graph_idx*num_nodes)+num_nodes)].to(x.device)//n_graphs
+            self.__set_masks__(graph_x, graph_edge_index)
+            self.to(x.device)
+            optimizer = torch.optim.Adam([self.edge_mask],
+                                     lr=self.lr)
+            for epoch in range(1, self.epochs + 1):
+                optimizer.zero_grad()
+                log_logit = self.model(x=graph_x, edge_index=graph_edge_index, batch=graph_batch)
+                pred_label = pred_labels[graph_idx]
+                loss = self.__loss__(None, log_logit, pred_label)
+                loss.backward()
+                optimizer.step()
+                
+            edge_mask = self.edge_mask.new_zeros(num_edges)
+            edge_mask = self.edge_mask.detach().sigmoid()
+            edge_masks = torch.cat([edge_masks,edge_mask])
+            self.__clear_masks__()
 
             if self.log:  # pragma: no cover
                 pbar.update(1)
@@ -250,12 +257,8 @@ class GNNExplainer(torch.nn.Module):
         if self.log:  # pragma: no cover
             pbar.close()
 
-        edge_mask = self.edge_mask.new_zeros(num_edges)
-        edge_mask = self.edge_mask.detach().sigmoid()
-
-        self.__clear_masks__()
-
-        return edge_mask
+        return edge_masks.reshape(n_graphs, -1)
+    
     def visualize_subgraph(self, node_idx, edge_index, edge_mask, y=None,
                            threshold=None, pos=None, num_hops=None, labels=None, **kwargs):
         r"""Visualizes the subgraph around :attr:`node_idx` given an edge mask
@@ -297,7 +300,7 @@ class GNNExplainer(torch.nn.Module):
                             device=edge_index.device)
         elif node_idx is not None:
             y = y[subset].to(torch.float) / y.max().item()
-        
+            
         data = Data(edge_index=edge_index, att=edge_mask, y=y,
                     num_nodes=y.size(0)).to('cpu')
         G = to_networkx(data, node_attrs=['y'], edge_attrs=['att'])
@@ -305,10 +308,11 @@ class GNNExplainer(torch.nn.Module):
         if node_idx is not None:
             mapping = {k: i for k, i in enumerate(subset.tolist())}
             G = nx.relabel_nodes(G, mapping)
+            labels = {n:lab for n,lab in labels.items() if n in subset}
 
         node_kwargs = copy(kwargs)
         node_kwargs['node_size'] = kwargs.get('node_size') or 800
-        node_kwargs['cmap'] = kwargs.get('cmap') or 'cool'
+        node_kwargs['cmap'] = kwargs.get('cmap') or 'Blues'
 
         label_kwargs = copy(kwargs)
         label_kwargs['font_size'] = kwargs.get('font_size') or 10
@@ -323,14 +327,14 @@ class GNNExplainer(torch.nn.Module):
                 '', xy=pos[target], xycoords='data', xytext=pos[source],
                 textcoords='data', arrowprops=dict(
                     arrowstyle="->",
+                    color='blue',
                     alpha=max(data['att'], 0.1),
                     shrinkA=sqrt(node_kwargs['node_size']) / 2.0,
                     shrinkB=sqrt(node_kwargs['node_size']) / 2.0,
                     connectionstyle="arc3,rad=0.1",
                 ))
-        nx.draw_networkx_nodes(G, pos, node_color=y.tolist(), **node_kwargs)
-        nx.draw_networkx_labels(G, pos, {n:lab for n,lab in labels.items() if n in subset}, **label_kwargs)
-
+        nx.draw_networkx_nodes(G, pos, **node_kwargs)
+        nx.draw_networkx_labels(G, pos, labels, **label_kwargs)
         return ax, G
 
 
